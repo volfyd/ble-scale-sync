@@ -4,6 +4,7 @@ import type {
   ConnectionContext,
   ScaleAdapterCore,
   GattWiring,
+  HoldForComposition,
   MultiCharNotify,
   ScaleReading,
   UserProfile,
@@ -44,7 +45,26 @@ const OP_BROADCAST_ADE = 0x22;
 const OP_RESPONSE_TRISA = 0xa1;
 const OP_RESPONSE_ADE = 0x20;
 
+// Weight Gurus A3 (Transtek) opcodes — same service as Trisa/ADE but
+// different handshake sequence and response opcodes.
+const OP_WG_ACCOUNT_ID = 0x21;
+const OP_WG_VERIFICATION = 0x20;
+const OP_WG_ENABLE_DISCONNECT = 0x22;
+const OP_WG_ADD_USER = 0x03;
+const OP_WG_PROFILE = 0x51;
+const OP_WG_SLOT_STATUS = 0x83;
+const WG_LAST_SLOT = 8;
+const WG_SLOT_NAME_LEN = 18;
+
 const EPOCH_2010 = 1262304000;
+
+function decodeSfloat16(raw: number): number {
+  let exponent = (raw >> 12) & 0x0f;
+  if (exponent >= 8) exponent -= 16;
+  let mantissa = raw & 0x0fff;
+  if (mantissa >= 0x0800) mantissa -= 0x1000;
+  return mantissa * Math.pow(10, exponent);
+}
 
 /**
  * Retry budget for a challenge-response write. BlueZ answers a badly timed
@@ -54,25 +74,30 @@ const EPOCH_2010 = 1262304000;
 const CHALLENGE_WRITE_RETRIES = 2;
 const CHALLENGE_RETRY_MS = 250;
 
-type Variant = 'trisa' | 'ade';
+type Variant = 'trisa' | 'ade' | 'weightgurus';
 
 /**
  * Adapter for the Trisa body-composition scale family.
  *
- * Two firmware variants are supported:
+ * Three firmware variants are supported:
  *   - Trisa (default): exposes 0x8A21 (notify) for measurement, full
  *     password + challenge handshake on 0x8A82.
  *   - ADE BA 1600 / fitvigo: 0x8A21 is missing; measurement arrives on 0x8A24
  *     (indicate). Different challenge-response and different
  *     "pairing complete" opcode (0x22 instead of 0x21). Body-composition
  *     decoding is not yet implemented; only weight is reported.
+ *   - Weight Gurus A3 (0375/0376, Transtek): uses 0x8A24 for measurement like
+ *     ADE, but speaks a multi-step Trisa-like handshake with different opcodes
+ *     (0x20 verification, 0x21 account ID) and requires waiting for 8 slot
+ *     status frames before completing setup.
  *
- * Variant detection happens in `onConnected()` via `ctx.availableChars`:
- * if 0x8A21 is missing but 0x8A24 is present → ADE.
+ * Variant detection: if a 0xA0 password frame arrives before onConnected and
+ * 0x8A21 is absent → weightgurus. Otherwise the original char-based detection
+ * applies.
  */
-export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNotify {
+export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNotify, HoldForComposition {
   readonly name = 'Trisa';
-  readonly match: MatchDescriptor = { priority: 140, names: { startsWith: ['01257b', '11257b'] } };
+  readonly match: MatchDescriptor = { priority: 140, names: { startsWith: ['01257b', '11257b', '1202b', '0202b'] } };
   // Legacy single-char fallback (only used when `characteristics` is ignored).
   readonly charNotifyUuid = CHR_MEASUREMENT_TRISA;
   readonly charWriteUuid = CHR_DOWNLOAD;
@@ -109,8 +134,32 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
    */
   private connected = false;
 
+  // --- Weight Gurus state ---
+  private wgSlotCount = 0;
+  private wgSetupDone = false;
+  private wgProfile: UserProfile | null = null;
+  private isWeightGurusName = false;
+  private wgPairingSession = false;
+  private wgComposition: ScaleBodyComp | null = null;
+  private wgExpectComposition = false;
+  private wgLastWeight = 0;
+  private wgLastImpedance = 0;
+  private wgBmr: number | null = null;
+
+  readonly completionHoldMs = 10_000;
+
+  isFinal(reading: ScaleReading): boolean {
+    if (this.variant !== 'weightgurus') return true;
+    return this.wgComposition !== null;
+  }
+
   matches(device: BleDeviceInfo): boolean {
-    return matchesDescriptor(device, this.match);
+    const matched = matchesDescriptor(device, this.match);
+    if (matched) {
+      const name = (device.localName || '').toLowerCase();
+      this.isWeightGurusName = name.startsWith('1202b') || name.startsWith('0202b');
+    }
+    return matched;
   }
 
   async onConnected(ctx: ConnectionContext): Promise<void> {
@@ -139,6 +188,45 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
 
     this.variant = this.detectVariant(ctx.availableChars);
     bleLog.debug(`Trisa adapter: variant=${this.variant}`);
+
+    if (this.variant === 'weightgurus') {
+      this.wgSlotCount = 0;
+      this.wgSetupDone = false;
+      this.wgPairingSession = false;
+      this.wgProfile = ctx.profile;
+
+      // On established sessions the scale doesn't resend 0xA0, so derive the
+      // password from the BLE MAC: first 4 octets in reverse byte order.
+      if (!this.password && ctx.deviceAddress) {
+        const mac = ctx.deviceAddress.replace(/:/g, '');
+        if (mac.length >= 8) {
+          const b = Buffer.from(mac.slice(0, 8), 'hex');
+          this.password = Buffer.from([b[3]!, b[2]!, b[1]!, b[0]!]);
+          bleLog.debug(`WG password derived from MAC: ${this.password.toString('hex')}`);
+        }
+      }
+
+      // The 0xA0 password frame typically arrives before onConnected(), so the
+      // Trisa path stores the password but can't write (no writeFn yet). Now
+      // that we have a write function and know we're weightgurus, send the
+      // account ID that the scale is waiting for.
+      if (this.password && this.pendingChallenge === null) {
+        // Pairing session: password received via 0xA0, no queued challenge yet.
+        bleLog.debug('WG password already received, sending account ID');
+        const accountId = Buffer.alloc(4);
+        accountId.writeUInt32LE((Math.floor(Math.random() * 0x7ffffffe) + 1) >>> 0, 0);
+        await ctx.write(CHR_DOWNLOAD, Buffer.from([OP_WG_ACCOUNT_ID, ...accountId]), true);
+        bleLog.debug('WG account ID sent');
+      }
+
+      const queued: Buffer | null = this.pendingChallenge;
+      if (queued) {
+        this.pendingChallenge = null;
+        bleLog.debug(`Replaying queued frame: ${queued.toString('hex')}`);
+        this.handleUploadChannel(queued);
+      }
+      return;
+    }
 
     // Time sync (same opcode on both variants).
     const now = Math.floor(Date.now() / 1000) - EPOCH_2010;
@@ -175,19 +263,26 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
     this.connected = false;
     this.writeFn = null;
     this.pendingChallenge = null;
-    this.password = null;
+    // Preserve password and variant across sessions — the adapter is a
+    // singleton and established sessions don't resend 0xA0.
+    this.wgSlotCount = 0;
+    this.wgSetupDone = false;
+    this.wgProfile = null;
+    this.wgExpectComposition = false;
+    this.wgLastWeight = 0;
   }
 
   /**
-   * Variant precedence: pick `ade` only when 0x8A21 is *absent* and 0x8A24 is
-   * present. Any other combination defaults to `trisa`, which preserves the
-   * original handshake. A hypothetical hybrid firmware exposing both chars
-   * would be driven as Trisa (the safer default: known protocol, known
-   * challenge response).
+   * Variant precedence: pick `weightgurus` when a password frame was received
+   * (Trisa-style auth) but 0x8A21 is absent (ADE-style measurement). Pick
+   * `ade` only when no password and 0x8A21 absent.
    */
   private detectVariant(available: ReadonlySet<string>): Variant {
     const hasTrisa = available.has(CHR_MEASUREMENT_TRISA);
     const hasAde = available.has(CHR_MEASUREMENT_ADE);
+    if (this.isWeightGurusName && !hasTrisa && hasAde) return 'weightgurus';
+    if (this.password && !hasTrisa && hasAde) return 'weightgurus';
+    if (this.password) return 'trisa';
     if (!hasTrisa && hasAde) return 'ade';
     return 'trisa';
   }
@@ -202,6 +297,10 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
    *   - 0x8A82: challenge (0xA1), no password frame; response algo unknown
    *   - 0x8A24: measurement data (Trisa-compatible weight encoding)
    *   - 0x8A22: body-composition push (encoding TBD)
+   * Weight Gurus A3:
+   *   - 0x8A82: password (0xA0), challenge (0xA1), slot status (0x83)
+   *   - 0x8A24: weight measurement (32-bit IEEE-11073 FLOAT)
+   *   - 0x8A22: body composition (16-bit SFLOATs)
    */
   parseCharNotification(charUuid: string, data: Buffer): ScaleReading | null {
     if (charUuid === CHR_UPLOAD) {
@@ -212,13 +311,10 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
       return this.parseMeasurement(data);
     }
     if (charUuid === CHR_BODYCOMP_ADE) {
-      // fitvigo's BE1615 protocol stubs out addBodyAnalysis (empty native
-      // function), so even the official app does not decode this frame from
-      // BLE; it derives body composition on-phone from weight + user
-      // profile. We follow the same approach via Deurenberg in computeMetrics.
-      // Logging the raw bytes still helps if a later firmware variant
-      // surfaces an actual encoding here.
-      bleLog.debug(`ADE body-comp frame on 0x8A22 (ignored, see comment): ${data.toString('hex')}`);
+      if (this.variant === 'weightgurus') {
+        return this.parseWgBodyComp(data);
+      }
+      bleLog.debug(`Body-comp frame on 0x8A22: ${data.toString('hex')}`);
       return null;
     }
     return null;
@@ -236,8 +332,10 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
   }
 
   computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {
-    const comp: ScaleBodyComp = {};
-    return buildPayload(reading.weight, reading.impedance, comp, profile);
+    const comp: ScaleBodyComp = this.wgComposition ?? {};
+    const result = buildPayload(reading.weight, reading.impedance, comp, profile);
+    if (this.wgBmr != null) result.bmr = this.wgBmr;
+    return result;
   }
 
   /**
@@ -254,6 +352,11 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
    * BE1615 never receives a 0xA0 frame, `savedPassword` stays at its default
    * zero, so the response collapses to `[0x20]` followed by an echo of the
    * same four bytes.
+   *
+   * Weight Gurus A3 flow:
+   *   Pairing: 0xA0 → send 0x21 (account ID); 0xA1 → send 0x20 (verification
+   *   = XOR(pw, challenge)); then 8x 0x83 → send 0x03+0x51+0x02+0x22.
+   *   Established: 0xA1 → send 0x20, 0x02 (time), 0x51 (profile).
    */
   private handleUploadChannel(data: Buffer): void {
     if (data.length < 2) return;
@@ -265,9 +368,14 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
     // to be dropped without so much as a log line: the scale then waited for an
     // ack that never came, once per cycle, forever (#138). Hold the raw frame
     // and replay it from onConnected(), where both are known.
-    if (opcode === OP_CHALLENGE && !this.connected) {
+    if ((opcode === OP_CHALLENGE || opcode === OP_WG_SLOT_STATUS) && !this.connected) {
       this.pendingChallenge = Buffer.from(data);
-      bleLog.debug('Challenge arrived before connect completed; queued for replay');
+      bleLog.debug('Frame arrived before connect completed; queued for replay');
+      return;
+    }
+
+    if (this.variant === 'weightgurus') {
+      this.handleWeightGurusUpload(opcode, data);
       return;
     }
 
@@ -299,6 +407,230 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
     }
   }
 
+  private handleWeightGurusUpload(opcode: number, data: Buffer): void {
+    if (opcode === OP_PASSWORD) {
+      if (data.length < 5) return;
+      this.password = Buffer.from(data.subarray(1, 5));
+      this.wgPairingSession = true;
+      bleLog.debug(`WG password received: ${this.password.toString('hex')}`);
+
+      // Pairing: claim an account ID so the scale commits the pairing.
+      const accountId = Buffer.alloc(4);
+      accountId.writeUInt32LE((Math.floor(Math.random() * 0x7ffffffe) + 1) >>> 0, 0);
+      this.sendResponse(
+        Buffer.from([OP_WG_ACCOUNT_ID, ...accountId]),
+        `WG account ID sent`,
+      );
+      return;
+    }
+
+    if (opcode === OP_CHALLENGE) {
+      if (data.length < 5) return;
+      const pw = this.password;
+      if (!pw) {
+        bleLog.debug('WG challenge without password — scale not paired');
+        return;
+      }
+      const challenge = data.subarray(1, 5);
+      const xored = Buffer.alloc(4);
+      for (let i = 0; i < 4; i++) {
+        xored[i] = challenge[i]! ^ (pw[i % pw.length] ?? 0);
+      }
+      bleLog.debug(`WG challenge: ${challenge.toString('hex')} → verification: ${xored.toString('hex')}`);
+      const onVerified = !this.wgPairingSession
+        ? () => {
+            bleLog.debug('WG established session, sending time + profile');
+            this.wgSendTimeAndProfile(1);
+          }
+        : undefined;
+
+      this.sendResponse(
+        Buffer.from([OP_WG_VERIFICATION, ...xored]),
+        `WG verification sent`,
+        Buffer.from(data),
+        onVerified,
+      );
+      // Pairing session: wait for 8x 0x83 slot status frames before setup.
+      return;
+    }
+
+    if (opcode === OP_WG_SLOT_STATUS) {
+      if (data.length < 2) return;
+      const slot = data[1] & 0xff;
+      this.wgSlotCount++;
+      bleLog.debug(`WG slot ${slot} status (${this.wgSlotCount}/${WG_LAST_SLOT}): ${data.toString('hex')}`);
+
+      if (this.wgSlotCount >= WG_LAST_SLOT && !this.wgSetupDone) {
+        bleLog.debug('WG all slots received, completing setup');
+        this.wgFinishSetup(1);
+      }
+      return;
+    }
+
+    bleLog.debug(`WG upload frame (opcode 0x${opcode.toString(16)}): ${data.toString('hex')}`);
+  }
+
+  private wgFinishSetup(slot: number): void {
+    if (this.wgSetupDone) return;
+    this.wgSetupDone = true;
+    const write = this.writeFn;
+    if (!write) return;
+
+    // Add user: [0x03, slot, 18-byte ASCII name padded with spaces]
+    const name = Buffer.alloc(WG_SLOT_NAME_LEN, 0x20);
+    const userName = 'BLEScaleSync';
+    for (let i = 0; i < Math.min(userName.length, WG_SLOT_NAME_LEN); i++) {
+      name[i] = userName.charCodeAt(i);
+    }
+    const addUser = Buffer.from([OP_WG_ADD_USER, slot, ...name]);
+
+    // Profile: [0x51, mask, slot, gender, age, heightLo, heightHi, unit]
+    const profile = this.wgProfile;
+    const heightCm = profile ? Math.min(profile.height, 204) : 170;
+    const heightSfloat = (heightCm * 10) | 0xd000;
+    const age = profile ? profile.age : 30;
+    const gender = profile?.gender === 'female' ? 0x02 : 0x01;
+    const profileCmd = Buffer.from([
+      OP_WG_PROFILE,
+      0x17, // field mask
+      slot,
+      gender,
+      age & 0xff,
+      heightSfloat & 0xff,
+      (heightSfloat >> 8) & 0xff,
+      0x00, // unit: kg
+    ]);
+
+    // Time sync
+    const now = Math.floor(Date.now() / 1000) - EPOCH_2010;
+    const timeCmd = Buffer.alloc(5);
+    timeCmd[0] = OP_TIME_SYNC;
+    timeCmd.writeUInt32LE(now, 1);
+
+    // Send the setup sequence. Each write must complete before the next.
+    write(CHR_DOWNLOAD, addUser, true)
+      .then(() => {
+        bleLog.debug('WG add-user sent');
+        return write(CHR_DOWNLOAD, profileCmd, true);
+      })
+      .then(() => {
+        bleLog.debug('WG profile sent');
+        return write(CHR_DOWNLOAD, timeCmd, true);
+      })
+      .then(() => {
+        bleLog.debug('WG time sync sent');
+        return write(CHR_DOWNLOAD, Buffer.from([OP_WG_ENABLE_DISCONNECT]), true);
+      })
+      .then(() => {
+        bleLog.debug('WG enable-disconnect sent — setup complete');
+      })
+      .catch((err: unknown) => {
+        bleLog.debug(`WG setup write failed: ${errMsg(err)}`);
+      });
+  }
+
+  private wgSendTimeAndProfile(slot: number): void {
+    const write = this.writeFn;
+    if (!write) return;
+
+    const now = Math.floor(Date.now() / 1000) - EPOCH_2010;
+    const timeCmd = Buffer.alloc(5);
+    timeCmd[0] = OP_TIME_SYNC;
+    timeCmd.writeUInt32LE(now, 1);
+
+    const profile = this.wgProfile;
+    const heightCm = profile ? Math.min(profile.height, 204) : 170;
+    const heightSfloat = (heightCm * 10) | 0xd000;
+    const age = profile ? profile.age : 30;
+    const gender = profile?.gender === 'female' ? 0x02 : 0x01;
+    const profileCmd = Buffer.from([
+      OP_WG_PROFILE,
+      0x17,
+      slot,
+      gender,
+      age & 0xff,
+      heightSfloat & 0xff,
+      (heightSfloat >> 8) & 0xff,
+      0x00,
+    ]);
+
+    write(CHR_DOWNLOAD, timeCmd, true)
+      .then(() => {
+        bleLog.debug('WG time sync sent');
+        return write(CHR_DOWNLOAD, profileCmd, true);
+      })
+      .then(() => {
+        bleLog.debug('WG profile sent — ready for measurement');
+      })
+      .catch((err: unknown) => {
+        bleLog.debug(`WG established session write failed: ${errMsg(err)}`);
+      });
+  }
+
+  private parseWgBodyComp(data: Buffer): ScaleReading | null {
+    if (data.length < 6) return null;
+    const flags = data[0]!;
+    let off = 1;
+
+    // Timestamp (uint32 LE) — always present after flags.
+    off += 4;
+
+    bleLog.debug(`WG body-comp frame: flags=0x${flags.toString(16)} raw=${data.toString('hex')}`);
+
+    const comp: ScaleBodyComp = {};
+
+    if (flags & 0x01) off += 1; // user id
+    if (flags & 0x02) {
+      if (off + 2 <= data.length) {
+        this.wgBmr = data.readUInt16LE(off);
+        bleLog.debug(`WG BMR: ${this.wgBmr} kcal`);
+      }
+      off += 2;
+    }
+    if (flags & 0x04) {
+      if (off + 2 <= data.length) {
+        comp.fat = decodeSfloat16(data.readUInt16LE(off));
+        bleLog.debug(`WG body fat: ${comp.fat}%`);
+      }
+      off += 2;
+    }
+    if (flags & 0x08) {
+      if (off + 2 <= data.length) {
+        comp.water = decodeSfloat16(data.readUInt16LE(off));
+        bleLog.debug(`WG body water: ${comp.water}%`);
+      }
+      off += 2;
+    }
+    if (flags & 0x10) {
+      if (off + 2 <= data.length) {
+        comp.visceralFat = decodeSfloat16(data.readUInt16LE(off));
+        bleLog.debug(`WG visceral fat: ${comp.visceralFat}`);
+      }
+      off += 2;
+    }
+    if (flags & 0x20) {
+      if (off + 2 <= data.length) {
+        comp.muscle = decodeSfloat16(data.readUInt16LE(off));
+        bleLog.debug(`WG muscle: ${comp.muscle}%`);
+      }
+      off += 2;
+    }
+    if (flags & 0x40) {
+      if (off + 2 <= data.length) {
+        const bonePercent = decodeSfloat16(data.readUInt16LE(off));
+        comp.bone = (bonePercent / 100) * this.wgLastWeight;
+        bleLog.debug(`WG bone: ${bonePercent}% → ${comp.bone.toFixed(2)}kg`);
+      }
+      off += 2;
+    }
+
+    this.wgComposition = comp;
+    if (this.wgLastWeight > 0) {
+      return { weight: this.wgLastWeight, impedance: this.wgLastImpedance };
+    }
+    return null;
+  }
+
   /**
    * Write a challenge response without awaiting it, but WITH a rejection
    * handler.
@@ -309,13 +641,14 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
    * unhandled rejection. In continuous mode that ends the service; only a
    * container restart policy brought it back.
    */
-  private sendResponse(response: Buffer, successLog?: string, replayOnFailure?: Buffer): void {
+  private sendResponse(response: Buffer, successLog?: string, replayOnFailure?: Buffer, onSuccess?: () => void): void {
     const write = this.writeFn;
     if (!write) return;
     const attempt = (retriesLeft: number): void => {
       write(CHR_DOWNLOAD, response, true).then(
         () => {
           if (successLog) bleLog.debug(successLog);
+          if (onSuccess) onSuccess();
         },
         (err: unknown) => {
           // `org.bluez.Error.InProgress` is what #138 actually hit, and it is
@@ -355,6 +688,14 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
    * Weight = mantissa * 10^exponent.
    * Impedance from resistance2: r2 < 410 ? 3.0 : 0.3 * (r2 - 400).
    *
+   * Weight Gurus A3 0x8A24 uses the same 32-bit IEEE-11073 FLOAT for weight
+   * (bytes 1-4 are identical encoding) but different flag meanings after byte 5:
+   *   0x01: timestamp (uint32, 4 bytes — not 7)
+   *   0x02: weight delta (32-bit FLOAT, 4 bytes)
+   *   0x04: impedance (32-bit FLOAT, 4 bytes)
+   *   0x08: user id (uint8)
+   *   0x10: status (uint8; bit4 = composition frame follows on 0x8A22)
+   *
    * NOTE: only the Trisa branch walks the optional-field table. For ADE the
    * post-weight layout is unverified (timestamp may be 8 bytes instead of 7)
    * and body comp arrives on a separate 0x8A22 push, so the parser
@@ -380,6 +721,40 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
     const weight = mantissa * Math.pow(10, exponent);
 
     if (weight <= 0 || !Number.isFinite(weight)) return null;
+
+    // Weight Gurus A3: the flag layout after the weight is different from Trisa.
+    // For now, return weight-only; impedance arrives on the separate 0x8A22
+    // body-composition frame which is logged but not yet decoded.
+    if (this.variant === 'weightgurus') {
+      this.wgLastWeight = weight;
+      this.wgComposition = null;
+      this.wgExpectComposition = false;
+      this.wgBmr = null;
+
+      let off = 5;
+      let wgImpedance = 0;
+      if (flags & 0x01) off += 4; // timestamp
+      if (flags & 0x02) off += 4; // weight delta
+      if (flags & 0x04) {
+        if (off + 4 <= data.length) {
+          const m = data[off]! | (data[off + 1]! << 8) | (data[off + 2]! << 16);
+          const e = data.readInt8(off + 3);
+          wgImpedance = m * Math.pow(10, e);
+          if (wgImpedance > 0) bleLog.debug(`WG impedance: ${wgImpedance.toFixed(1)} ohm`);
+        }
+        off += 4;
+      }
+      if (flags & 0x08) off += 1; // user id
+      if ((flags & 0x10) && off < data.length) {
+        const status = data[off]!;
+        this.wgExpectComposition = (status & 0x10) !== 0;
+        bleLog.debug(`WG status=0x${status.toString(16)} expectComposition=${this.wgExpectComposition}`);
+      }
+
+      this.wgLastImpedance = wgImpedance;
+      bleLog.debug(`WG weight frame: ${weight.toFixed(2)}kg impedance=${wgImpedance.toFixed(1)} flags=0x${flags.toString(16)} raw=${data.toString('hex')}`);
+      return { weight, impedance: wgImpedance };
+    }
 
     // ADE BA 1600: only the weight bytes are verified (single capture frame in
     // #138). The post-weight layout (timestamp width, resistance encoding)
