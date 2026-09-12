@@ -272,7 +272,10 @@ export async function autoDiscover(
       try {
         const dev = await btAdapter.getDevice(addr);
         const name = await dev.getName().catch(() => '');
-        if (!name) continue;
+        if (!name) {
+          helperOf(dev).removeListeners();
+          continue;
+        }
 
         bleLog.debug(`Discovered: ${name} [${addr}]`);
 
@@ -300,6 +303,7 @@ export async function autoDiscover(
           bleLog.info(`Auto-discovered: ${matched.name} (${name} [${addr}])`);
           return { device: dev, adapter: matched, mac: addr };
         }
+        helperOf(dev).removeListeners();
       } catch {
         /* device may have gone away */
       }

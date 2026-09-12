@@ -19,6 +19,7 @@ export interface BluezHelper {
   prop(name: string): Promise<unknown>;
   set(name: string, value: Variant): Promise<void>;
   callMethod(method: string, ...args: unknown[]): Promise<unknown>;
+  removeListeners(): void;
   object: string;
 }
 

@@ -19,7 +19,9 @@ export function makeLivenessAdapter(btAdapter: Adapter): LivenessAdapter {
     rssiOf: async (addr) => {
       try {
         const dev = await btAdapter.getDevice(addr);
-        const rssi = await helperOf(dev).prop('RSSI');
+        const helper = helperOf(dev);
+        const rssi = await helper.prop('RSSI');
+        helper.removeListeners();
         return typeof rssi === 'number' ? rssi : undefined;
       } catch {
         return undefined;
