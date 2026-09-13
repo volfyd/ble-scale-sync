@@ -121,6 +121,8 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
   private variant: Variant = 'trisa';
   /** Stored password from opcode 0xA0 (Trisa). ADE does not send this. */
   private password: Buffer | null = null;
+  /** True when 0xA0 arrived in this GATT session (a pairing session). */
+  private _pairingPasswordReceived = false;
   /** Reference to write function, saved from onConnected context. */
   private writeFn: ConnectionContext['write'] | null = null;
   /** Challenge frame that arrived before the connection was ready (#138). */
@@ -210,8 +212,12 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
       // Trisa path stores the password but can't write (no writeFn yet). Now
       // that we have a write function and know we're weightgurus, send the
       // account ID that the scale is waiting for.
-      if (this.password && this.pendingChallenge === null) {
-        // Pairing session: password received via 0xA0, no queued challenge yet.
+      //
+      // Guard on _pairingPasswordReceived: on established sessions the scale
+      // skips 0xA0 and sends 0xA1 directly. Without this guard a password
+      // preserved from a previous session makes this block fire, sending a new
+      // random account ID that the scale rejects (instant disconnect).
+      if (this._pairingPasswordReceived && this.pendingChallenge === null) {
         bleLog.debug('WG password already received, sending account ID');
         const accountId = Buffer.alloc(4);
         accountId.writeUInt32LE((Math.floor(Math.random() * 0x7ffffffe) + 1) >>> 0, 0);
@@ -263,6 +269,7 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
     this.connected = false;
     this.writeFn = null;
     this.pendingChallenge = null;
+    this._pairingPasswordReceived = false;
     // Preserve password and variant across sessions — the adapter is a
     // singleton and established sessions don't resend 0xA0.
     this.wgSlotCount = 0;
@@ -396,6 +403,7 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
 
     if (opcode === OP_PASSWORD) {
       this.password = Buffer.from(data.subarray(1));
+      this._pairingPasswordReceived = true;
     } else if (opcode === OP_CHALLENGE && this.password) {
       const challenge = data.subarray(1);
       const response = Buffer.alloc(challenge.length + 1);
@@ -412,6 +420,7 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
       if (data.length < 5) return;
       this.password = Buffer.from(data.subarray(1, 5));
       this.wgPairingSession = true;
+      this._pairingPasswordReceived = true;
       bleLog.debug(`WG password received: ${this.password.toString('hex')}`);
 
       // Pairing: claim an account ID so the scale commits the pairing.
