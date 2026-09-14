@@ -1,5 +1,6 @@
 import type { RawReading } from '../ble/shared.js';
 import { abortableSleep } from '../ble/types.js';
+import { bleFailureKind } from '../ble/failure-kind.js';
 import { createLogger } from '../logger.js';
 import { errMsg } from '../utils/error.js';
 import { MissingTransportModuleError } from '../ble/transport-availability.js';
@@ -82,9 +83,14 @@ export async function runContinuousLoop(deps: RuntimeLoopDeps): Promise<void> {
         // logs the message as an error and exits non-zero.
         if (err instanceof MissingTransportModuleError) throw err;
         onFailure?.(err);
-        backoffMs = backoffMs === 0 ? BACKOFF_INITIAL_MS : Math.min(backoffMs * 2, BACKOFF_MAX_MS);
-        log.info(`${failureLogPrefix}, retrying in ${backoffMs / 1000}s... (${errMsg(err)})`);
-        await abortableSleep(backoffMs, signal).catch(() => {});
+        if (bleFailureKind(err) === 'idle') {
+          backoffMs = 0;
+          log.info(`${failureLogPrefix}, retrying... (${errMsg(err)})`);
+        } else {
+          backoffMs = backoffMs === 0 ? BACKOFF_INITIAL_MS : Math.min(backoffMs * 2, BACKOFF_MAX_MS);
+          log.info(`${failureLogPrefix}, retrying in ${backoffMs / 1000}s... (${errMsg(err)})`);
+          await abortableSleep(backoffMs, signal).catch(() => {});
+        }
       }
     }
   } finally {
