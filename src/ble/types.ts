@@ -25,7 +25,7 @@ export const DISCOVERY_TIMEOUT_MS = 120_000;
 export const DISCOVERY_POLL_MS = 2_000;
 
 /** Timeout for GATT service/characteristic enumeration after connecting. */
-export const GATT_DISCOVERY_TIMEOUT_MS = 30_000;
+export const GATT_DISCOVERY_TIMEOUT_MS = 8_000;
 
 /**
  * How long the reading phase waits without a notification from the scale. The
