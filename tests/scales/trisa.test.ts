@@ -463,6 +463,43 @@ describe('TrisaAdapter', () => {
     });
   });
 
+  describe('Weight Gurus stored readings', () => {
+    // Captured from a Weight Gurus 0375: the live reading (87.40 kg) arrives
+    // first, then an unsynced reading from the previous day (87.70 kg).
+    const live = Buffer.from('3f242200fe82588a1f00000000000000ff0109', 'hex');
+    const stored = Buffer.from('3f422200fe7514891f00000000000000ff0109', 'hex');
+
+    async function connectWeightGurus() {
+      const adapter = makeAdapter();
+      expect(
+        adapter.matches(mockPeripheral('0202B 26BD5D44', ['0d005750-c36b-11e3-9c1a-0800200c9a66'])),
+      ).toBe(true);
+      const { ctx } = ctxWithChars(ADE_CHARS);
+      await adapter.onConnected!(ctx);
+      return adapter;
+    }
+
+    it('ignores a stored reading older than the live one', async () => {
+      const adapter = await connectWeightGurus();
+      expect(adapter.parseCharNotification!(uuid16(0x8a24), live)!.weight).toBeCloseTo(87.4, 2);
+      expect(adapter.parseCharNotification!(uuid16(0x8a24), stored)).toBeNull();
+    });
+
+    it('keeps the newer reading when the stored one arrives first', async () => {
+      const adapter = await connectWeightGurus();
+      expect(adapter.parseCharNotification!(uuid16(0x8a24), stored)!.weight).toBeCloseTo(87.7, 2);
+      expect(adapter.parseCharNotification!(uuid16(0x8a24), live)!.weight).toBeCloseTo(87.4, 2);
+    });
+
+    it('forgets the newest timestamp when the session ends', async () => {
+      const adapter = await connectWeightGurus();
+      adapter.parseCharNotification!(uuid16(0x8a24), live);
+      adapter.onSessionEnd!();
+      await adapter.onConnected!(ctxWithChars(ADE_CHARS).ctx);
+      expect(adapter.parseCharNotification!(uuid16(0x8a24), stored)!.weight).toBeCloseTo(87.7, 2);
+    });
+  });
+
   describe('isComplete()', () => {
     it('returns true when weight > 0', () => {
       const adapter = makeAdapter();

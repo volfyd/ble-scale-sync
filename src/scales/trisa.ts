@@ -145,6 +145,7 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
   private wgComposition: ScaleBodyComp | null = null;
   private wgExpectComposition = false;
   private wgLastWeight = 0;
+  private wgNewestTimestamp = 0;
   private wgLastImpedance = 0;
   private wgBmr: number | null = null;
 
@@ -277,6 +278,7 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
     this.wgProfile = null;
     this.wgExpectComposition = false;
     this.wgLastWeight = 0;
+    this.wgNewestTimestamp = 0;
   }
 
   /**
@@ -735,6 +737,15 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
     // For now, return weight-only; impedance arrives on the separate 0x8A22
     // body-composition frame which is logged but not yet decoded.
     if (this.variant === 'weightgurus') {
+      // The scale sends the live reading first, then replays unsynced older ones.
+      if ((flags & 0x01) && data.length >= 9) {
+        const timestamp = data.readUInt32LE(5);
+        if (timestamp < this.wgNewestTimestamp) {
+          bleLog.debug(`WG skipping older stored frame: ${weight.toFixed(2)}kg raw=${data.toString('hex')}`);
+          return null;
+        }
+        this.wgNewestTimestamp = timestamp;
+      }
       this.wgLastWeight = weight;
       this.wgComposition = null;
       this.wgExpectComposition = false;
